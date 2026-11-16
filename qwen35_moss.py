@@ -136,18 +136,23 @@ def _unpermute_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim):
     return t.permute(*perm).contiguous().reshape(*shape)
 
 
-def _dequant(t):
-    """Return a plain torch tensor for a (possibly quantized) GGMLTensor."""
+def _dequant_plain(t):
+    """Dequantize to a PLAIN torch tensor (no GGMLTensor subclass).
+
+    IMPORTANT: never keep the GGMLTensor subclass on a tensor whose data we
+    reshape/permute. GGMLTensor carries `tensor_type` / `tensor_shape`
+    metadata that does NOT follow reshape/permute/contiguous. A mismatch
+    between that metadata and the real storage makes ComfyUI-GGUF's
+    GGMLTensor.to() read out of bounds, which shows up as
+    "Windows fatal exception: access violation".
+    """
     if isinstance(t, GGMLTensor):
-        return dequantize_tensor(t, dtype=torch.float16)
+        out = dequantize_tensor(t, dtype=torch.float16)
+        if isinstance(out, GGMLTensor):
+            # strip the subclass (keeps the storage, drops the stale metadata)
+            out = out.as_subclass(torch.Tensor)
+        return out
     return t
-
-
-def _as_plain(t):
-    """Wrap a plain tensor back into a GGMLTensor so the loader keeps its type."""
-    if isinstance(t, GGMLTensor):
-        return t
-    return GGMLTensor(t, tensor_type=None, tensor_shape=t.shape)
 
 
 def qwen35_moss_sd_map(raw_sd, metadata=None):
@@ -178,7 +183,11 @@ def qwen35_moss_sd_map(raw_sd, metadata=None):
 
 
 def qwen35_moss_fix_shapes(sd):
-    """conv1d: GGML [kernel, channels] -> torch [channels, 1, kernel]."""
+    """conv1d: GGML [kernel, channels] -> torch [channels, 1, kernel].
+
+    conv1d is F32 in the GGUF, so the data is already dequantized. The result
+    is a plain torch tensor - no GGMLTensor metadata needed.
+    """
     for key in list(sd.keys()):
         if key.endswith(".linear_attn.conv1d.weight"):
             t = sd[key]
@@ -186,13 +195,7 @@ def qwen35_moss_fix_shapes(sd):
             if len(shape) == 2:
                 # shape is [channels, kernel] in torch convention (reversed ggml ne)
                 channels, kernel = shape
-                new = t.reshape(channels, 1, kernel)
-                sd[key] = GGMLTensor(
-                    new,
-                    tensor_type=getattr(t, "tensor_type", None),
-                    tensor_shape=new.shape,
-                    patches=getattr(t, "patches", []).copy(),
-                )
+                sd[key] = _dequant_plain(t).reshape(channels, 1, kernel)
     return sd
 
 
@@ -211,15 +214,16 @@ def qwen35_moss_unpermute(sd, metadata):
         return sd
 
     num_v_per_k = num_v_heads // num_k_heads
-    value_head_dim = state_size or 128
-    key_dim = num_k_heads * 128  # linear_key_head_dim
+    value_head_dim = (inner_size // num_v_heads) if inner_size else (state_size or 128)
+    key_dim = num_k_heads * (state_size or 128)  # linear_key_head_dim
     conv_dim = key_dim * 2 + inner_size
 
     logging.info(
-        "Qwen3.5: unpermuting V heads (k=%s, v=%s, v_per_k=%s)",
+        "Qwen3.5: unpermuting V heads (k=%s, v=%s, v_per_k=%s, v_head_dim=%s)",
         num_k_heads,
         num_v_heads,
         num_v_per_k,
+        value_head_dim,
     )
 
     for key in list(sd.keys()):
@@ -230,42 +234,33 @@ def qwen35_moss_unpermute(sd, metadata):
         try:
             if leaf == "in_proj_qkv.weight":
                 # rows: [q(key_dim) | k(key_dim) | v(value_dim)] - only v is permuted
-                t = _dequant(sd[key])
+                t = _dequant_plain(sd[key])
                 qk = key_dim * 2
                 qk_part, v_part = t[:qk], t[qk:]
                 v_part = _unpermute_v_heads(v_part, 0, num_k_heads, num_v_per_k, value_head_dim)
-                sd[key] = _as_plain(torch.cat([qk_part, v_part], dim=0))
+                sd[key] = torch.cat([qk_part, v_part], dim=0)
             elif leaf == "in_proj_z.weight":
-                t = _dequant(sd[key])
-                sd[key] = _as_plain(
-                    _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, value_head_dim)
-                )
+                t = _dequant_plain(sd[key])
+                sd[key] = _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, value_head_dim)
             elif leaf in ("in_proj_a.weight", "in_proj_b.weight"):
-                t = _dequant(sd[key])
-                sd[key] = _as_plain(
-                    _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, 1)
-                )
+                t = _dequant_plain(sd[key])
+                sd[key] = _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, 1)
             elif leaf in ("dt_bias", "A_log"):
-                t = _dequant(sd[key])
-                sd[key] = _as_plain(
-                    _unpermute_v_heads(t.reshape(-1), 0, num_k_heads, num_v_per_k, 1)
-                )
+                t = _dequant_plain(sd[key])
+                sd[key] = _unpermute_v_heads(t.reshape(-1), 0, num_k_heads, num_v_per_k, 1)
             elif leaf == "conv1d.weight":
-                t = _dequant(sd[key])
+                t = _dequant_plain(sd[key])
                 # conv1d weight in torch convention: [channels, 1, kernel]
                 ch = t.shape[0]
                 qk_channels = key_dim * 2
                 qk_part, v_part = t[:qk_channels], t[qk_channels:]
                 v_part = _unpermute_v_heads(v_part, 0, num_k_heads, num_v_per_k, value_head_dim)
-                merged = torch.cat([qk_part, v_part], dim=0).reshape(ch, 1, -1)
-                sd[key] = _as_plain(merged)
+                sd[key] = torch.cat([qk_part, v_part], dim=0).reshape(ch, 1, -1)
             elif leaf == "out_proj.weight":
                 # permutation runs along the *input* axis of out_proj, which for
                 # k-quants is the quantized axis -> must be dequantized first.
-                t = _dequant(sd[key])
-                sd[key] = _as_plain(
-                    _unpermute_v_heads(t, 1, num_k_heads, num_v_per_k, value_head_dim)
-                )
+                t = _dequant_plain(sd[key])
+                sd[key] = _unpermute_v_heads(t, 1, num_k_heads, num_v_per_k, value_head_dim)
         except Exception as e:
             logging.warning("Qwen3.5: failed to unpermute %s: %s", key, e)
 
