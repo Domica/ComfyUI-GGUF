@@ -64,15 +64,21 @@ UNPERMUTE_V_HEADS = True
 
 # Whether to load the lm_head ("output.weight") into the model.
 #
-# The lm_head is ONLY used for text *generation* (logits). MOSS-Image outpaint
-# uses the text encoder in *encode* mode, where the lm_head is never touched.
+# IMPORTANT: keep this True.
 #
-# ComfyUI-GGUF cannot dequantize a GGMLTensor through core's generic
-# `cast_bias_weight` path (core does not know about GGMLTensor and casts the
-# raw byte buffer instead), so a quantized lm_head breaks `logits()`.
-# Loading it is therefore off by default: the module still exists (created by
-# core), it is simply left uninitialised and unused.
-INCLUDE_LM_HEAD = False
+# Core always creates the lm_head module (Linear(hidden, vocab)) even though
+# MOSS-Image encoding never uses it (the text encoder only needs the last
+# hidden state). If the weight is NOT loaded, that module keeps ComfyUI's
+# uninitialised float32 buffer -> 4096 * 248320 * 4 bytes = ~4.07 GB of garbage
+# that gets pinned to the GPU and OOMs (or hard-crashes) a 6 GB card.
+#
+# Loading the quantized lm_head instead keeps it at ~412 MB (Q6_K).
+#
+# Side effect: text *generation* (logits) still does not work with a
+# quantized lm_head, because core's generic cast_bias_weight() does not know
+# about GGMLTensor and casts the raw byte buffer instead. That path is unused
+# for MOSS-Image outpaint.
+INCLUDE_LM_HEAD = True
 
 # leaf module name -> (core module name, drop_weight_suffix)
 # Matching is done on the exact leaf name, so "attn_q" can never corrupt
