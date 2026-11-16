@@ -254,8 +254,17 @@ def qwen35_moss_unpermute(sd, metadata):
                 t = _dequant_plain(sd[key])
                 sd[key] = _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, 1)
             elif leaf in ("dt_bias", "A_log"):
-                t = _dequant_plain(sd[key])
-                sd[key] = _unpermute_v_heads(t.reshape(-1), 0, num_k_heads, num_v_per_k, 1)
+                t = _dequant_plain(sd[key]).reshape(-1)
+                if leaf == "A_log":
+                    # llama.cpp stores the *precomputed decay* -exp(A_log),
+                    # not A_log itself. ComfyUI core does -exp(A_log) again
+                    # inside GatedDeltaNet.forward, so without this inverse
+                    # the decay is applied twice (~13x too strong) on all
+                    # linear-attention layers -> garbage conditioning.
+                    # Verified numerically against qwen3.5_9b_int8_convrot:
+                    #   -exp(A_log_sf) tiled == gguf ssm_a  (cos=1.0, maxdiff=0).
+                    t = torch.log(-t)
+                sd[key] = _unpermute_v_heads(t, 0, num_k_heads, num_v_per_k, 1)
             elif leaf == "conv1d.weight":
                 t = _dequant_plain(sd[key])
                 # conv1d weight in torch convention: [channels, 1, kernel]

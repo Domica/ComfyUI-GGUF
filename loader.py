@@ -51,19 +51,38 @@ def get_list_field(reader, field_name, field_type):
 def get_gguf_metadata(reader):
     """Extract all simple metadata fields like safetensors"""
     metadata = {}
+    vt = gguf.GGUFValueType
+    # Newer gguf packages renamed F32 -> FLOAT32 and expose UINT* types.
+    # Referencing a missing enum member used to raise AttributeError inside
+    # the loop, silently skipping *all* following integer fields (including
+    # qwen35.ssm.group_count / time_step_rank), which disabled the V-head
+    # permutation in the Qwen3.5 MOSS adapter.
+    f32 = getattr(vt, "FLOAT32", None) or getattr(vt, "F32", None)
+    f64 = getattr(vt, "FLOAT64", None)
+    int_types = {
+        getattr(vt, n) for n in
+        ("INT8", "INT16", "INT32", "INT64", "UINT8", "UINT16", "UINT32", "UINT64")
+        if hasattr(vt, n)
+    }
+    float_types = {t for t in (f32, f64) if t is not None}
     for field_name in reader.fields:
         try:
             field = reader.get_field(field_name)
             if len(field.types) == 1:  # Simple scalar fields only
-                if field.types[0] == gguf.GGUFValueType.STRING:
-                    metadata[field_name] = str(field.parts[field.data[-1]], "utf-8")
-                elif field.types[0] == gguf.GGUFValueType.INT32:
-                    metadata[field_name] = int(field.parts[field.data[-1]])
-                elif field.types[0] == gguf.GGUFValueType.F32:
-                    metadata[field_name] = float(field.parts[field.data[-1]])
-                elif field.types[0] == gguf.GGUFValueType.BOOL:
-                    metadata[field_name] = bool(field.parts[field.data[-1]])
-        except:
+                t = field.types[0]
+                part = field.parts[field.data[-1]]
+                # Scalar metadata is stored as a 1-element numpy memmap; newer
+                # numpy refuses int()/float() on non-0d arrays, so index [0].
+                scalar = part.reshape(-1)[0] if hasattr(part, "reshape") else part
+                if t == vt.STRING:
+                    metadata[field_name] = str(part, "utf-8")
+                elif t in int_types:
+                    metadata[field_name] = int(scalar)
+                elif t in float_types:
+                    metadata[field_name] = float(scalar)
+                elif t == vt.BOOL:
+                    metadata[field_name] = bool(scalar)
+        except Exception:
             continue
     return metadata
 
