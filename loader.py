@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "qwen35"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -479,6 +479,20 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
+    elif arch == "qwen35":
+        # Qwen3.5 / MOSS-Image text encoder.
+        #
+        # ComfyUI core supports Qwen3.5 natively (comfy/text_encoders/qwen35.py
+        # + moss_image.py, CLIPType.MOSS_IMAGE), but only through the
+        # *safetensors* loader. This adapts the llama.cpp GGUF layout
+        # (key names, V-head order, conv1d shape) to what core expects.
+        #
+        # The tokenizer is not needed here - core ships it in
+        # comfy/text_encoders/qwen35_tokenizer/ and loads it itself.
+        from .qwen35_moss import qwen35_moss_prepare
+        metadata = extra.get("metadata", {}) or {}
+        logging.info(f"Qwen3.5: preparing GGUF text encoder for MOSS-Image ({arch})")
+        sd = qwen35_moss_prepare(sd, metadata)
     elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
