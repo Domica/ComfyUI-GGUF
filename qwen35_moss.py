@@ -60,7 +60,8 @@ from .dequant import dequantize_tensor
 from .ops import GGMLTensor
 
 # Toggle this off if your GGUF was produced without llama.cpp's V-head reorder.
-UNPERMUTE_V_HEADS = True
+# A/B test: currently OFF - Unsloth GGUF may already be in grouped order.
+UNPERMUTE_V_HEADS = False
 
 # Whether to load the lm_head ("output.weight") into the model.
 #
